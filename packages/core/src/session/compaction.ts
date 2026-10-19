@@ -81,6 +81,8 @@ type Result = {
 
 type Failure = {
   readonly error: SessionError.Error
+  /** The request could still fit the window if it were smaller, so `deliver` retries against a lower target. */
+  readonly shrink?: true
 }
 
 type Prepared = Effect.Success<ReturnType<SessionModelRequest.Interface["compaction"]>>
@@ -429,16 +431,22 @@ export const layer = Layer.effect(
         const attempt = yield* Effect.result(send(request))
         if (Result.isSuccess(attempt)) return attempt.success
         const cause = attempt.failure
-        if (!(cause instanceof AIError)) return yield* Effect.fail(cause)
-        const error = toSessionError(cause)
-        const tooLarge = cause.reason._tag === "InvalidRequest" && cause.reason.classification === "payload-too-large"
+        // A summary that fills the output budget means the request was too large for this provider's
+        // tokenizer. It is not an AI error, but it asks for the same shrink as a "too long" rejection.
+        if (!(cause instanceof AIError) && cause.shrink !== true) return yield* Effect.fail(cause)
+        const error = cause instanceof AIError ? toSessionError(cause) : cause.error
+        const tooLarge =
+          cause instanceof AIError &&
+          cause.reason._tag === "InvalidRequest" &&
+          cause.reason.classification === "payload-too-large"
+        const retryable = !(cause instanceof AIError) || tooLarge || isContextOverflowFailure(cause)
 
         if (tooLarge && request === prepared.request) {
           asText = true
           continue
         }
 
-        if (tooLarge || isContextOverflowFailure(cause)) {
+        if (retryable) {
           const step = SHRINK_STEPS[rejections]
           if (step === undefined) return yield* Effect.fail<Failure>({ error })
           rejected ??= estimateRequest(request)
@@ -446,6 +454,7 @@ export const layer = Layer.effect(
           rejections++
           continue
         }
+        if (!(cause instanceof AIError)) return yield* Effect.fail(cause)
 
         const decision = yield* policy({
           cause,
@@ -556,9 +565,12 @@ export const layer = Layer.effect(
                   new AIError({ reason: new UnknownProviderError({ message: "Compaction generation failed" }) }),
                 )
               case "length":
-                return unusable({
-                  type: "compaction.failed",
-                  message: "Compaction summary reached the output token limit",
+                // The output budget is the room the input leaves in the window, so a summary that fills it
+                // means the request was too large for this provider's tokenizer. Shrink like a "too long"
+                // rejection instead of ending the session (#56862).
+                return Effect.fail<Failure>({
+                  error: { type: "compaction.failed", message: "Compaction summary reached the output token limit" },
+                  shrink: true,
                 })
               case "content-filter":
                 return unusable(contentFilterError("Compaction summary was blocked by the provider", event.reason))

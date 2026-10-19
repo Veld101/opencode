@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test"
+import { beforeEach, expect, test } from "bun:test"
 import { GenerationOptions, LLMClient, LLMEvent, LanguageModel, ToolDefinition, type LLMRequest } from "@opencode/ai"
 import { OpenAIChat } from "@opencode/ai/protocols"
 import { Database } from "@opencode/core/database/database"
@@ -48,9 +48,18 @@ const cost = [
     },
   },
 ]
+let lengthReplies = 0
 const client = Layer.mock(LLMClient.Service)({
   stream: (request: LLMRequest) => {
     requests.push(request)
+    // Simulates a provider that fills the window: report `length` until the request is small enough.
+    if (lengthReplies > 0) {
+      lengthReplies--
+      return Stream.make(
+        LLMEvent.textDelta({ id: "summary", text: "## Objective\n- partial" }),
+        LLMEvent.finish({ reason: { normalized: "length" } }),
+      )
+    }
     return Stream.make(
       LLMEvent.textDelta({ id: "summary", text: "## Objective\n- manual summary" }),
       LLMEvent.stepFinish({
@@ -72,6 +81,11 @@ const client = Layer.mock(LLMClient.Service)({
   },
   generate: () => Effect.die("unused"),
 })
+beforeEach(() => {
+  requests = []
+  lengthReplies = 0
+})
+
 const resolved = SessionRunnerModel.resolved(model, {
   capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
   cost,
@@ -495,6 +509,31 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
       { type: Bus.versionedType(SessionEvent.UsageRecorded.type, 1) },
       { type: Bus.versionedType(SessionEvent.Compaction.Ended.type, 1) },
     ])
+  }),
+)
+
+// A provider whose tokenizer overshoots the estimate stops with `length` once input plus output fill the
+// window. Treating that as final ends the session; shrinking the request like a "too long" rejection lets
+// the summary finish instead (#56862).
+it.effect("compaction shrinks and retries when the summary hits the output limit", () =>
+  Effect.gen(function* () {
+    requests = []
+    lengthReplies = 1
+    const sessionID = Session.ID.make("ses_compaction_length")
+    const session = yield* insertSession(sessionID)
+    const messages = Array.from({ length: 8 }, (_, index) =>
+      SessionMessage.User.make({
+        id: SessionMessage.ID.create(),
+        type: "user",
+        text: `Analysis part ${index}: ${"the parser keeps one token of lookahead. ".repeat(40)}`,
+        time: { created: DateTime.makeUnsafe(index) },
+      }),
+    )
+
+    expect(yield* compactManually(session, messages)).toEqual({ status: "completed" })
+    expect(requests).toHaveLength(2)
+    // Shrinking has to reduce what is sent, or the retry would hit the same limit.
+    expect(requests[1]!.messages.length).toBeLessThan(requests[0]!.messages.length)
   }),
 )
 
